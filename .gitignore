@@ -1,0 +1,31 @@
+# Build outputs
+build/
+*.exe
+*.obj
+*.res
+*.pdb
+*.ilk
+*.log
+*.dmp
+*.bak
+RCa*
+sign_binary.ps1
+check_sig.ps1
+
+# Local Steam runtime files (redistributable/user-specific)
+steam_api.dll
+steam_appid.txt
+*.cer
+*.pfx
+*.p12
+*.pvk
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+
+# Editor and OS files
+.vs/
+.vscode/
+.DS_Store
+Thumbs.db
