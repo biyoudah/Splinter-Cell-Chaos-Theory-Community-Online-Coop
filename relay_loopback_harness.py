@@ -121,6 +121,18 @@ def drain(events, collected):
             return
 
 
+def wait_for_heartbeats(events, collected, timeout=8.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        drain(events, collected)
+        roles = {e[1] for e in collected if e[0] == "heartbeat"}
+        if roles == {"H", "G"}:
+            return roles
+        time.sleep(0.05)
+    drain(events, collected)
+    return {e[1] for e in collected if e[0] == "heartbeat"}
+
+
 def main():
     ctx = mp.get_context("spawn")
     events = ctx.Queue()
@@ -133,10 +145,9 @@ def main():
     try:
         host.start()
         guest.start()
-        time.sleep(3)
-        drain(events, collected)
-        assert any(e[0] == "heartbeat" and e[1] == "H" for e in collected), "host did not receive guest heartbeat replies"
-        assert any(e[0] == "heartbeat" and e[1] == "G" for e in collected), "guest did not receive host heartbeat replies"
+        roles = wait_for_heartbeats(events, collected)
+        assert "H" in roles, f"host did not receive guest heartbeat replies; events={collected}; proxy={proxy.count}/{proxy.forwarded}/{proxy.dropped}"
+        assert "G" in roles, "guest did not receive host heartbeat replies"
         print("PASS: separate host and guest processes exchange CH_CTRL keepalives under 80 ms delay and deterministic loss")
 
         time.sleep(35)

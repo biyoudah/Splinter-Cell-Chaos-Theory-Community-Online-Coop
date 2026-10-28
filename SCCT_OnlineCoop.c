@@ -83,7 +83,7 @@ static void init_process_apis(void)
 
 typedef uint64_t u64;
 
-#define SCCT_VERSION "1.0.0-rc3"
+#define SCCT_VERSION "1.0.0-rc4"
 #define DIRECT_IP_DEFAULT_PORT 7790
 
 static const int DISC_PORTS[] = { 9102, 9103, 8878 };
@@ -99,7 +99,8 @@ static const int GAME_PORTS[] = { 7777, 7776 };
 
 #define SEND_UNRELIABLE_NO_NAGLE 1
 #define SEND_RELIABLE 8
-/* SteamNetworkingMessages can reopen a failed session when a new send is attempted. */
+/* SteamNetworkingMessages can reopen a failed session when a new send is attempted.
+ * Use it only for throttled recovery probes, never on ordinary traffic. */
 #define SEND_AUTO_RESTART_BROKEN_SESSION 32
 
 #define CH_GAME  0
@@ -218,6 +219,7 @@ typedef struct {
     Conn conns[MAX_CONNS];
     DWORD last_heard;
     DWORD last_ping;
+    DWORD last_restart_tick;
     uint32_t packets_in;
     uint32_t packets_out;
 } Peer;
@@ -457,15 +459,53 @@ static int steam_send(u64 sid, const void *data, int size, int flags, int channe
     unsigned char id[IDENT_SIZE];
     ident(id, sid);
     int result = S.SendMessageToUser(g_msgs, id, data, (uint32_t)size,
-                                     flags | SEND_AUTO_RESTART_BROKEN_SESSION, channel);
+                                     (uint32_t)flags, channel);
     if (result != 1) {
         DWORD now = GetTickCount();
         if (now - g_last_steam_send_error_log >= 5000) {
             g_last_steam_send_error_log = now;
-            scct_log("[STEAM] SendMessageToUser failed (result=%d channel=%d); session restart requested", result, channel);
+            scct_log("[STEAM] SendMessageToUser failed (result=%d channel=%d)", result, channel);
         }
     }
     return result;
+}
+
+static int steam_restart_peer(Peer *peer, const char *reason)
+{
+    DWORD now = GetTickCount();
+    if (!peer || !peer->sid) return 0;
+    if (peer->last_restart_tick && now - peer->last_restart_tick < 10000u) return 0;
+    peer->last_restart_tick = now;
+    unsigned char id[IDENT_SIZE];
+    ident(id, peer->sid);
+    int result = S.SendMessageToUser(g_msgs, id, "K", 1,
+                                     SEND_RELIABLE | SEND_AUTO_RESTART_BROKEN_SESSION, CH_CTRL);
+    scct_log("[STEAM] Recovery probe (%s) result=%d; requested a single session restart",
+             reason ? reason : "session recovery", result);
+    return result;
+}
+
+static const char *steam_failure_state_name(int state)
+{
+    switch (state) {
+    case 0: return "none";
+    case 1: return "connecting";
+    case 2: return "finding route";
+    case 3: return "connected";
+    case 4: return "closed by peer";
+    case 5: return "problem detected locally";
+    case 6: return "fin wait";
+    case 7: return "linger";
+    case 8: return "dead";
+    default: return "unknown state";
+    }
+}
+
+static const char *steam_end_reason_name(int reason)
+{
+    /* Steam's public k_ESteamNetConnectionEnd_Misc_P2P_Rendezvous value. */
+    if (reason == 5008) return "P2P rendezvous failed (no specific cause supplied)";
+    return "other/unspecified Steam end reason";
 }
 
 static void steam_accept(u64 sid)
@@ -716,7 +756,7 @@ static bool locate_game(void)
 
 
 /* ---------------------------------------------------------------- DIAGNOSTIC LOG & HANG WATCHDOG
- * Everything important (level detection, cutscene triggers, voice gating, network drops, game hangs)
+ * Everything important (level detection, voice gating, network drops, game hangs)
  * is written to SCCT_OnlineCoop.log next to the launcher (or %TEMP% if that folder is read-only),
  * so a freeze / disconnect can be audited after the fact instead of guessed.
  */
@@ -726,7 +766,6 @@ static bool g_log_ready = false;
 static char g_log_dir[MAX_PATH] = {0};
 
 static volatile DWORD g_last_game_pkt_tick = 0;
-static volatile LONG g_cutscene_active = 0;
 
 static void scct_log_init(void)
 {
@@ -849,11 +888,11 @@ static void game_hang_watchdog(DWORD pid)
             s_hung_since = now;
             DWORD last_pkt = (DWORD)InterlockedCompareExchange((volatile LONG *)&g_last_game_pkt_tick, 0, 0);
             if (last_pkt) {
-                scct_log("[HANG] Game window (pid %lu) is NOT RESPONDING. cutscene_active=%ld last_game_packet_age=%lu ms",
-                         pid, g_cutscene_active, now - last_pkt);
+                scct_log("[HANG] Game window (pid %lu) is NOT RESPONDING. last_game_packet_age=%lu ms",
+                         pid, now - last_pkt);
             } else {
-                scct_log("[HANG] Game window (pid %lu) is NOT RESPONDING. cutscene_active=%ld last_game_packet=never",
-                         pid, g_cutscene_active);
+                scct_log("[HANG] Game window (pid %lu) is NOT RESPONDING. last_game_packet=never",
+                         pid);
             }
             if (s_dumped_pid != pid) { s_dumped_pid = pid; hang_write_dump(pid); }
         }
@@ -1339,58 +1378,10 @@ static void patch_game_voice(HANDLE hProc, DWORD pid)
 
 static u64 g_host_sid = 0;
 
-/* ---------------------------------------------------------------- CUTSCENE BRIEFING SUBSYSTEM */
-
-static void handle_ctrl_command(const char *cmd);
+/* ---------------------------------------------------------------- Network control and game-state helpers */
 
 static volatile SOCKET g_direct_ext_sock = INVALID_SOCKET;
 static struct sockaddr_in g_direct_remote_host = {0};
-
-/* The launcher has no verified game-thread cutscene hook. Never substitute an
- * external video window: it would leave the other player's game running. */
-static void cutscene_advertise_tick(DWORD now)
-{
-    (void)now;
-}
-
-static bool cutscene_try_trigger(const char *why, bool broadcast)
-{
-    static volatile LONG warned = 0;
-    (void)broadcast;
-    if (InterlockedCompareExchange(&warned, 1, 0) == 0) {
-        scct_log("[CUTSCENE] Native in-game trigger is not verified; synchronized playback is unavailable (%s).", why ? why : "unknown");
-        printf("[CUTSCENE] Synchronized briefing playback is unavailable until a verified in-game trigger is implemented.\n");
-    }
-    return false;
-}
-
-static void handle_ctrl_command(const char *cmd)
-{
-    if (!cmd) return;
-    if (strncmp(cmd, "C:skip", 6) == 0) {
-        scct_log("[CUTSCENE] Ignored partner skip request; no launcher playback is active.");
-    } else if (strncmp(cmd, "C:", 2) == 0) {
-        const char *map = cmd + 2;
-        if (strstr(map, "panama") || strstr(map, "Panama"))
-            cutscene_try_trigger("partner", false);
-    }
-}
-
-static bool read_unreal_object_name(HANDLE h, uint32_t object, uint32_t gnames,
-                                    char *name, size_t name_cap)
-{
-    uint32_t name_idx = 0, entry = 0;
-    SIZE_T got = 0;
-    if (!object || !name || name_cap < 2 ||
-        !ReadProcessMemory(h, (LPCVOID)(uintptr_t)(object + 0x20), &name_idx, 4, &got) ||
-        name_idx == 0 || name_idx > 0x100000u ||
-        !ReadProcessMemory(h, (LPCVOID)(uintptr_t)(gnames + name_idx * 4u), &entry, 4, &got) ||
-        !entry ||
-        !ReadProcessMemory(h, (LPCVOID)(uintptr_t)(entry + 0x0C), name, name_cap - 1, &got))
-        return false;
-    name[name_cap - 1] = '\0';
-    return name[0] != '\0';
-}
 
 static void voice_tick_game(void)
 {
@@ -1472,7 +1463,7 @@ static void voice_tick_game(void)
     }
     InterlockedExchange(&g_voice_prox_scale_bits, voice_float_bits(prox));
 
-    /* Check current level name to trigger map-specific briefing cutscenes (e.g. 01_Panama) */
+    /* Read the active level name for voice scene gating and diagnostics. */
     char cur_map[64] = {0};
     uint32_t glevel = 0;
     uint32_t gnames = 0;
@@ -1524,41 +1515,6 @@ static void voice_tick_game(void)
         }
     }
 
-    /* Multiplayer clients may have no GEngine->GLevel. Their PlayerController still
-     * references the active XLevel/package; inspect its pointer fields and accept only
-     * object names resolved through the verified GNames table. */
-    static DWORD last_controller_level_scan = 0;
-    DWORD map_scan_now = GetTickCount();
-    if (!cur_map[0] && c0 && gnames && map_scan_now - last_controller_level_scan >= 1000u) {
-        last_controller_level_scan = map_scan_now;
-        uint32_t controller_words[512] = {0};
-        SIZE_T bytes_read = 0;
-        if (ReadProcessMemory(h, (LPCVOID)(uintptr_t)c0, controller_words,
-                              sizeof(controller_words), &bytes_read) &&
-            bytes_read >= sizeof(uint32_t) * 32) {
-            size_t word_count = bytes_read / sizeof(uint32_t);
-            for (size_t i = 0; i < word_count; i++) {
-                uint32_t candidate = controller_words[i];
-                char candidate_name[64] = {0};
-                /* Avoid probing scalar fields and out-of-range values as pointers. */
-                if (candidate < 0x01000000u || candidate >= 0x7FFE0000u) continue;
-                if (read_unreal_object_name(h, candidate, gnames, candidate_name, sizeof(candidate_name)) &&
-                    ci_contains(candidate_name, "panama")) {
-                    strncpy(cur_map, candidate_name, sizeof(cur_map) - 1);
-                    break;
-                }
-                uint32_t outer = 0;
-                if (ReadProcessMemory(h, (LPCVOID)(uintptr_t)(candidate + 0x18), &outer, 4, &r) && outer &&
-                    read_unreal_object_name(h, outer, gnames, candidate_name, sizeof(candidate_name)) &&
-                    ci_contains(candidate_name, "panama")) {
-                    strncpy(cur_map, candidate_name, sizeof(cur_map) - 1);
-                    break;
-                }
-            }
-        }
-    }
-
-    bool is_panama = (ci_contains(cur_map, "Panama") || ci_contains(cur_map, "panama"));
     bool is_menu = (ci_contains(cur_map, "menu") || ci_contains(cur_map, "Index") || ci_contains(cur_map, "Entry") || (eng != 0 && glevel == 0) || !cur_map[0]);
     bool in_game_level = in_mission && !is_menu && (cur_map[0] != '\0');
     InterlockedExchange(&g_voice_channel_active, in_game_level ? 1 : 0);
@@ -1567,12 +1523,6 @@ static void voice_tick_game(void)
     if (strcmp(s_last_map_log, cur_map) != 0) {
         strncpy(s_last_map_log, cur_map, sizeof(s_last_map_log) - 1);
         scct_log("[MAP] Current map: '%s' (in_game_level=%d in_mission=%d)", cur_map[0] ? cur_map : "<empty>", in_game_level, in_mission);
-    }
-
-    if (is_menu) {
-        /* Menu or lobby active */
-    } else if (is_panama) {
-        cutscene_try_trigger("level_detect", true);
     }
 
     /* 1. Synchronize Sound Options from ds:[0x111F9F64] */
@@ -2504,7 +2454,6 @@ static int run_universal_host(int listen_port)
             }
             printf("[NETWORK] Partner timed out. Slot is open again.\n");
         }
-        if (has_client) cutscene_advertise_tick(now);
 
         static DWORD s_last_host_udp_ping = 0;
         if (has_client && (now - s_last_host_udp_ping > 1500)) {
@@ -2548,12 +2497,6 @@ static int run_universal_host(int listen_port)
                 if (got >= 2 && buf[1] == 'K') {
                     unsigned char pong[2] = { CH_CTRL, 'P' };
                     sendto(s_ext, (char *)pong, sizeof(pong), 0, (struct sockaddr *)&client_remote, sizeof(client_remote));
-                }
-                if (got >= 3 && buf[1] == 'C' && buf[2] == ':') {
-                    char cmd[64] = {0};
-                    int clen = (got - 1 < (int)sizeof(cmd) - 1) ? got - 1 : (int)sizeof(cmd) - 1;
-                    memcpy(cmd, (char *)buf + 1, clen);
-                    handle_ctrl_command(cmd);
                 }
                 continue; /* Session keepalive / NAT ping */
             }
@@ -2912,12 +2855,6 @@ static int run_universal_join(const char *target_input, int target_port)
                     unsigned char pong[2] = { CH_CTRL, 'P' };
                     sendto(s_ext, (char *)pong, sizeof(pong), 0, (struct sockaddr *)&remote_host, sizeof(remote_host));
                 }
-                if (got_ext >= 3 && buf[1] == 'C' && buf[2] == ':') {
-                    char cmd[64] = {0};
-                    int clen = (got_ext - 1 < (int)sizeof(cmd) - 1) ? got_ext - 1 : (int)sizeof(cmd) - 1;
-                    memcpy(cmd, (char *)buf + 1, clen);
-                    handle_ctrl_command(cmd);
-                }
                 continue;
             }
             if (ch == CH_VOICE) {
@@ -3053,17 +2990,18 @@ static void host_steam_cb(int id, void *data)
         memcpy(&failure, data, sizeof(failure));
         Peer *p = find_peer(sid);
         if (p) {
-            /* Steam reports transient relay/session failures here too. Keep the lobby
-             * peer alive and let AutoRestartBrokenSession plus the heartbeat retry. */
-            p->last_ping = 0;
-            scct_log("[STEAM] Session to %llu failed (state=%ld end_reason=%ld); retrying through relay",
-                     sid, (long)failure.state, (long)failure.end_reason);
-            steam_send(sid, "K", 1, SEND_RELIABLE, CH_CTRL);
+            /* Do not restart a session on every ordinary send. One host-side recovery
+             * probe is enough; the 10-second guard prevents duplicate restart races. */
+            scct_log("[STEAM] Session to %llu failed (state=%ld/%s end_reason=%ld/%s)",
+                     sid, (long)failure.state, steam_failure_state_name(failure.state),
+                     (long)failure.end_reason, steam_end_reason_name(failure.end_reason));
+            steam_restart_peer(p, "failure callback");
         } else {
             /* A failure callback alone is not proof that this user joined our lobby.
              * Do not allocate a relay peer until a session request is accepted. */
-            scct_log("[STEAM] Ignoring failed session for non-peer %llu (state=%ld end_reason=%ld)",
-                     sid, (long)failure.state, (long)failure.end_reason);
+            scct_log("[STEAM] Ignoring failed session for non-peer %llu (state=%ld/%s end_reason=%ld/%s)",
+                     sid, (long)failure.state, steam_failure_state_name(failure.state),
+                     (long)failure.end_reason, steam_end_reason_name(failure.end_reason));
         }
         break;
     }
@@ -3154,7 +3092,6 @@ static int run_steam_host(void)
             patch_running_games();
         }
         pump_steam(host_steam_cb);
-        cutscene_advertise_tick(now);
 
         void *msgs[64];
         int n;
@@ -3192,12 +3129,6 @@ static int run_steam_host(void)
                     int sz = *(int *)((char *)msgs[i] + 4);
                     char *cdata = *(char **)msgs[i];
                     if (sz >= 1 && cdata[0] == 'B') drop_peer(p, "player exited");
-                    else if (sz >= 2 && cdata[0] == 'C' && cdata[1] == ':') {
-                        char cmd[64] = {0};
-                        int clen = (sz < (int)sizeof(cmd) - 1) ? sz : (int)sizeof(cmd) - 1;
-                        memcpy(cmd, cdata, clen);
-                        handle_ctrl_command(cmd);
-                    }
                 }
                 S.MessageRelease(msgs[i]);
             }
@@ -3290,11 +3221,16 @@ static int run_steam_host(void)
                     InterlockedExchange((volatile LONG *)&g_last_game_pkt_tick, (LONG)now);
                     steam_send(p->sid, buf, got + 3, SEND_UNRELIABLE_NO_NAGLE, CH_GAME);
                 }
-                /* Keep game sockets through long loading and cutscene gaps;
+                /* Keep game sockets through long loading gaps;
                  * drop_peer closes them after the session heartbeat expires. */
             }
             if (now - p->last_ping > 1000) { p->last_ping = now; steam_send(p->sid, "K", 1, SEND_RELIABLE, CH_CTRL); }
-            if (now - p->last_heard > 60000) { scct_log("[STEAM] Peer %llu timed out (%lu ms)", p->sid, now - p->last_heard); drop_peer(p, "timed out"); }
+            if (now - p->last_heard > 8000u) steam_restart_peer(p, "heartbeat silence");
+            if (now - p->last_heard > 60000) {
+                scct_log("[STEAM] Disconnecting peer %llu: heartbeat timeout (%lu ms without inbound traffic)",
+                         p->sid, now - p->last_heard);
+                drop_peer(p, "heartbeat timeout");
+            }
         }
 
         /* Forward outgoing voice frames to Steam Partners */
@@ -3357,9 +3293,9 @@ static void client_steam_cb(int id, void *data)
         SteamSessionFailurePrefix failure;
         memcpy(&failure, data, sizeof(failure));
         if (sid == g_host_sid) {
-            scct_log("[STEAM] Host relay session failed (state=%ld end_reason=%ld); retrying heartbeat",
-                     (long)failure.state, (long)failure.end_reason);
-            steam_send(g_host_sid, "P", 1, SEND_RELIABLE, CH_CTRL);
+            scct_log("[STEAM] Host relay session failed (state=%ld/%s end_reason=%ld/%s); waiting for host recovery probe",
+                     (long)failure.state, steam_failure_state_name(failure.state),
+                     (long)failure.end_reason, steam_end_reason_name(failure.end_reason));
         }
         break;
     }
@@ -3395,7 +3331,6 @@ static int run_steam_client(u64 target_lobby)
     }
     if (!g_host_sid) fail("Could not connect to Steam Lobby. Make sure host is running!");
 
-    steam_accept(g_host_sid);
     steam_send(g_host_sid, "P", 1, SEND_RELIABLE, CH_CTRL);
 
     SOCKET s_disc[NUM_DISC_PORTS];
@@ -3463,9 +3398,8 @@ static int run_steam_client(u64 target_lobby)
         }
         if (now - last_host_heard > 60000 && now - last_session_retry > 10000) {
             last_session_retry = now;
-            scct_log("[STEAM] Host heartbeat timeout after %lu ms; accepting session and retrying reliable relay ping",
+            scct_log("[STEAM] Host heartbeat timeout after %lu ms; sending a normal liveness probe",
                      now - last_host_heard);
-            steam_accept(g_host_sid);
             steam_send(g_host_sid, "P", 1, SEND_RELIABLE, CH_CTRL);
         }
 
@@ -3576,11 +3510,6 @@ static int run_steam_client(u64 target_lobby)
                     char *cdata = *(char **)msgs[i];
                     if (sz == 1 && cdata[0] == 'K') {
                         steam_send(g_host_sid, "P", 1, SEND_UNRELIABLE_NO_NAGLE, CH_CTRL);
-                    } else if (sz >= 2 && cdata[0] == 'C' && cdata[1] == ':') {
-                        char cmd[64] = {0};
-                        int clen = (sz < (int)sizeof(cmd) - 1) ? sz : (int)sizeof(cmd) - 1;
-                        memcpy(cmd, cdata, clen);
-                        handle_ctrl_command(cmd);
                     } else if (sz >= 1 && cdata[0] == 'B') {
                         InterlockedExchange(&g_host_left, 1);
                         scct_log("[STEAM] Host sent an orderly session close.");
@@ -4053,7 +3982,7 @@ static void saver_start(void)
 
 /* ---------------------------------------------------------------- GRAPHICAL SERVER BROWSER */
 
-enum { ID_LIST = 100, ID_REFRESH, ID_JOIN, ID_HOSTPUB, ID_HOSTROOM, ID_JOINCODE, ID_TESTCUTSCENE, ID_CODE, ID_MICCOMBO, ID_MICBAR, ID_MICPCT, ID_MICTEST, ID_VOICEMODE, ID_STATUS, ID_SAVER, ID_TIMER = 1 };
+enum { ID_LIST = 100, ID_REFRESH, ID_JOIN, ID_HOSTPUB, ID_HOSTROOM, ID_JOINCODE, ID_CODE, ID_MICCOMBO, ID_MICBAR, ID_MICPCT, ID_MICTEST, ID_VOICEMODE, ID_STATUS, ID_SAVER, ID_TIMER = 1 };
 typedef enum { ACT_NONE, ACT_JOIN_STEAM, ACT_HOST_STEAM, ACT_HOST_ROOM, ACT_JOIN_ROOM } GuiAct;
 
 static GuiAct g_act = ACT_NONE;
@@ -4185,9 +4114,6 @@ static LRESULT CALLBACK gui_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
         SendMessageA(g_hCode, WM_SETFONT, (WPARAM)font, TRUE);
         h = CreateWindowExA(0, "BUTTON", "Join Room", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 392, 309, 110, 26, wnd, (HMENU)(INT_PTR)ID_JOINCODE, NULL, NULL);
         SendMessageA(h, WM_SETFONT, (WPARAM)font, TRUE);
-        h = CreateWindowExA(0, "BUTTON", "Test Cutscene", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, 508, 309, 100, 26, wnd, (HMENU)(INT_PTR)ID_TESTCUTSCENE, NULL, NULL);
-        SendMessageA(h, WM_SETFONT, (WPARAM)font, TRUE);
-
         h = CreateWindowExA(0, "STATIC", "Voice Chat Mic:", WS_CHILD | WS_VISIBLE, 14, 347, 94, 18, wnd, NULL, NULL, NULL);
         SendMessageA(h, WM_SETFONT, (WPARAM)font, TRUE);
         g_hMicCombo = CreateWindowExA(0, "COMBOBOX", "", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
@@ -4281,9 +4207,6 @@ static LRESULT CALLBACK gui_proc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
             GetWindowTextA(g_hCode, g_act_code, sizeof(g_act_code));
             if (!g_act_code[0]) { gui_set_status("Type your friend's Room Code or IP first."); break; }
             g_act = ACT_JOIN_ROOM; DestroyWindow(wnd); break;
-        case ID_TESTCUTSCENE:
-            gui_set_status("Cutscene test is unavailable: the current player opens outside the game.");
-            break;
         case ID_MICCOMBO:
             if (HIWORD(wp) == CBN_SELCHANGE) {
                 int sel = (int)SendMessageA(g_hMicCombo, CB_GETCURSEL, 0, 0);
@@ -4403,14 +4326,6 @@ int main(int argc, char **argv)
         }
         else if (!strcmp(argv[i], "--join-steam") && i + 1 < argc) {
             if (steam_ok) return run_steam_client(strtoull(argv[++i], NULL, 10));
-        }
-    }
-
-    for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--test-cutscene")) {
-            printf("[CUTSCENE] External playback is disabled. Native in-game synchronization is not implemented.\n");
-            scct_log("[CUTSCENE] --test-cutscene requested; no external player was opened because native synchronization is unavailable.");
-            return 0;
         }
     }
 
