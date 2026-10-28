@@ -1,5 +1,5 @@
 SPLINTER CELL: CHAOS THEORY — COMMUNITY ONLINE CO-OP
-Work in progress. Test build v1.0.0-rc3.
+Work in progress. Test build v1.0.0-rc5.
 
 The launcher relays the game's co-op discovery and gameplay traffic between two PCs. Choose Steam networking for a public lobby or direct UDP for a private room (port 7790).
 

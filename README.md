@@ -1,6 +1,6 @@
 # Splinter Cell Chaos Theory: Community Online Co-op
 
-**Work in progress — test build v1.0.0-rc4.** This project is a 32-bit Windows launcher and network relay for online co-op in *Splinter Cell: Chaos Theory*. It connects the game’s existing co-op networking between two players and adds experimental voice support.
+**Work in progress — test build v1.0.0-rc5.** This project is a 32-bit Windows launcher and network relay for online co-op in *Splinter Cell: Chaos Theory*. It connects the game’s existing co-op networking between two players and adds experimental voice support.
 
 ## What it does
 
@@ -35,7 +35,7 @@ The x86 executable is written to `build/`. The build uses `/W4`, `/GS`, Control 
 
 This is a prerelease for testing, not a stable 1.0 release.
 
-- **Connectivity:** Steam sends no longer request a session restart on every packet. The host uses a throttled recovery probe after a failure or heartbeat silence, and session acceptance follows Steam’s request callback. Steam SDR, public direct UDP, and two-PC recovery still need testing. The loopback fixture could not receive local UDP packets in this restricted test environment, so it remains unverified.
+- **Connectivity:** Steam sends no longer request a session restart on every packet. After a failed session callback, the host probes immediately and the client schedules a rate-limited recovery probe 2.5 seconds later; an incoming host heartbeat cancels the client's pending retry. The local two-process loopback fixture passed with simulated packet loss, delay, a 62-second idle period, and guest reconnect. This fixture does not run Steam or the game; Steam SDR and two-PC recovery remain unverified.
 - **Voice and display:** voice devices, proximity audio, windowed/fullscreen transitions, alt-tab, and minimize/restore need live testing.
 - **Game compatibility:** fixed-address patches and window settings may vary by game build. Ubisoft Connect, Steam, and standalone releases have not all been validated.
 - **Mission loading:** a temporary not-responding screen was observed during a mission transition. The available dump did not establish its cause.

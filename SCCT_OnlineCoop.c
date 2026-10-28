@@ -2,7 +2,7 @@
  * SCCT_OnlineCoop: Universal Online Co-op Restorer for Tom Clancy's Splinter Cell: Chaos Theory.
  * Compatibility depends on the game's executable build and verified patch bytes.
  *
- * Version 1.0.0-rc3: stability and diagnostics update.
+ * Version 1.0.0-rc5: client-side Steam session recovery.
  */
 
 #define _CRT_SECURE_NO_WARNINGS
@@ -83,7 +83,7 @@ static void init_process_apis(void)
 
 typedef uint64_t u64;
 
-#define SCCT_VERSION "1.0.0-rc4"
+#define SCCT_VERSION "1.0.0-rc5"
 #define DIRECT_IP_DEFAULT_PORT 7790
 
 static const int DISC_PORTS[] = { 9102, 9103, 8878 };
@@ -235,6 +235,8 @@ static bool g_no_launch = false;
 
 static volatile bool g_running = true;
 static DWORD g_last_steam_send_error_log = 0;
+static DWORD g_client_last_restart_tick = 0;
+static DWORD g_client_recovery_due = 0;
 static void scct_log(const char *fmt, ...);
 
 static BOOL WINAPI console_ctrl_handler(DWORD signal)
@@ -478,6 +480,21 @@ static int steam_restart_peer(Peer *peer, const char *reason)
     peer->last_restart_tick = now;
     unsigned char id[IDENT_SIZE];
     ident(id, peer->sid);
+    int result = S.SendMessageToUser(g_msgs, id, "K", 1,
+                                     SEND_RELIABLE | SEND_AUTO_RESTART_BROKEN_SESSION, CH_CTRL);
+    scct_log("[STEAM] Recovery probe (%s) result=%d; requested a single session restart",
+             reason ? reason : "session recovery", result);
+    return result;
+}
+
+static int steam_restart_client(u64 sid, const char *reason)
+{
+    DWORD now = GetTickCount();
+    if (!sid) return 0;
+    if (g_client_last_restart_tick && now - g_client_last_restart_tick < 10000u) return 0;
+    g_client_last_restart_tick = now;
+    unsigned char id[IDENT_SIZE];
+    ident(id, sid);
     int result = S.SendMessageToUser(g_msgs, id, "K", 1,
                                      SEND_RELIABLE | SEND_AUTO_RESTART_BROKEN_SESSION, CH_CTRL);
     scct_log("[STEAM] Recovery probe (%s) result=%d; requested a single session restart",
@@ -3293,9 +3310,10 @@ static void client_steam_cb(int id, void *data)
         SteamSessionFailurePrefix failure;
         memcpy(&failure, data, sizeof(failure));
         if (sid == g_host_sid) {
-            scct_log("[STEAM] Host relay session failed (state=%ld/%s end_reason=%ld/%s); waiting for host recovery probe",
+            scct_log("[STEAM] Host relay session failed (state=%ld/%s end_reason=%ld/%s); scheduling client recovery probe",
                      (long)failure.state, steam_failure_state_name(failure.state),
                      (long)failure.end_reason, steam_end_reason_name(failure.end_reason));
+            g_client_recovery_due = GetTickCount() + 2500u;
         }
         break;
     }
@@ -3417,6 +3435,10 @@ static int run_steam_client(u64 target_lobby)
             patch_running_games();
         }
         pump_steam(client_steam_cb);
+        if (g_client_recovery_due && (LONG)(now - g_client_recovery_due) >= 0) {
+            g_client_recovery_due = 0;
+            steam_restart_client(g_host_sid, "client failure callback");
+        }
         if (InterlockedCompareExchange(&g_host_left, 0, 0)) {
             printf("[STEAM] Host left the lobby. Ending this relay session.\n");
             break;
@@ -3509,6 +3531,8 @@ static int run_steam_client(u64 target_lobby)
                     int sz = *(int *)((char *)msgs[i] + 4);
                     char *cdata = *(char **)msgs[i];
                     if (sz == 1 && cdata[0] == 'K') {
+                        /* The host heartbeat confirms that its recovery probe got through. */
+                        g_client_recovery_due = 0;
                         steam_send(g_host_sid, "P", 1, SEND_UNRELIABLE_NO_NAGLE, CH_CTRL);
                     } else if (sz >= 1 && cdata[0] == 'B') {
                         InterlockedExchange(&g_host_left, 1);
